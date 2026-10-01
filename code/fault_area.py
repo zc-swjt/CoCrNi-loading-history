@@ -31,7 +31,7 @@ def budget(before,after):
     return dict(initial=initial,final=final,net=final-initial,
         classification_gain=gain,classification_loss=loss,
         retained_fault_inflow=inflow,retained_fault_outflow=outflow,
-        retained_area_metric_change=metric,unresolved_coverage=unknown,balance_error=residual)
+        retained_area_metric_change=metric,unresolved_coverage=unknown)
 
 def atom_state(a):
     n=len(a['fault_type'])

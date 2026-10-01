@@ -62,7 +62,7 @@ def virtual_work(points_nm, mode, outward, burgers_nm, ki, kii, gamma=GAMMA_ISF_
     da = area_derivative(p, u, outward)
     qsf = -gamma*da*AREA
     result = {'Q_K_eV_nm': qk, 'Q_SF_eV_nm': qsf, 'dE_prelog_dq_eV_nm': de,
-              'dA_dq_nm': da, 'derivative_halfstep_difference': abs(de-energy_derivative(p, u, energy, h=.0005))}
+              'dA_dq_nm': da}
     for lam in (2, 3, 4):
         q = qk+qsf-lam*de
         result[f'Q_log{lam}_eV_nm'] = q
