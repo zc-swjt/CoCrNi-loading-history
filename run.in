@@ -1,0 +1,10 @@
+potential nep.txt
+time_step 1
+move_field 0
+kfield_schedule basis.txt schedule.txt
+ensemble heat_lan 300 100 0 1 2
+compute 0 20 1 temperature potential force
+dump_thermo 20
+dump_exyz 200 1 0 0 0
+dump_restart 2000
+run 84000

@@ -1,0 +1,257 @@
+--- a/src/integrate/integrate.cu
++++ b/src/integrate/integrate.cu
+@@ -55,6 +55,21 @@
+ {
+   this->total_steps = total_steps;
+   int number_of_atoms = atom.number_of_atoms;
++  if (field_move_group >= 0) {
++    if (move_group >= 0) {
++      PRINT_INPUT_ERROR("It is not allowed to combine 'move' and 'move_field'.");
++    }
++    if (fixed_group >= 0 && fixed_grouping_method != field_move_grouping_method) {
++      PRINT_INPUT_ERROR("The fixed and field-moving groups must use the same grouping method.");
++    }
++    if (fixed_group == field_move_group && fixed_group >= 0) {
++      PRINT_INPUT_ERROR("The fixed and field-moving groups cannot be the same.");
++    }
++    if (type != 0 && type != 1 && type != 2 && type != 3 && type != 4 && type != 5 &&
++        type != 6 && type != 22) {
++      PRINT_INPUT_ERROR("'move_field' is only supported with NVE, NVT, or heat_lan ensembles.");
++    }
++  }
+   if (move_group >= 0) {
+     if (fixed_group < 0) {
+       PRINT_INPUT_ERROR("It is not allowed to have moving group but no fixed group.");
+@@ -252,14 +267,22 @@
+   ensemble->fixed_group = fixed_group;
+   ensemble->fixed_grouping_method = fixed_grouping_method;
+   ensemble->move_grouping_method = move_grouping_method;
++  ensemble->field_move_group = field_move_group;
++  ensemble->field_move_grouping_method = field_move_grouping_method;
++  if (field_move_group >= 0) {
++    ensemble->field_velocity_per_atom.resize(number_of_atoms * 3);
++    ensemble->field_velocity_per_atom.copy_from_device(atom.velocity_per_atom.data());
++  }
+ }
+ 
+ void Integrate::finalize()
+ {
+   fixed_group = -1; // no group has an index of -1
+   move_group = -1;
++  field_move_group = -1;
+   fixed_grouping_method = 0;
+   move_grouping_method = 0;
++  field_move_grouping_method = 0;
+   deform_x = 0;
+   deform_y = 0;
+   deform_z = 0;
+@@ -1237,6 +1260,39 @@
+   }
+ }
+ 
++void Integrate::parse_move_field(const char** param, int num_param, std::vector<Group>& group)
++{
++  if (num_param != 2 && num_param != 3) {
++    PRINT_INPUT_ERROR("Keyword 'move_field' should have 1 or 2 parameters.");
++  }
++  if (group.size() < 1) {
++    PRINT_INPUT_ERROR("Cannot use 'move_field' without a grouping method.");
++  }
++
++  int gid_index = 1;
++  if (num_param == 3) {
++    if (!is_valid_int(param[1], &field_move_grouping_method)) {
++      PRINT_INPUT_ERROR("Grouping method for 'move_field' should be an integer.");
++    }
++    gid_index = 2;
++  } else {
++    field_move_grouping_method = 0;
++  }
++  if (field_move_grouping_method < 0 || field_move_grouping_method >= group.size()) {
++    PRINT_INPUT_ERROR("Grouping method for 'move_field' is out of range.");
++  }
++  if (!is_valid_int(param[gid_index], &field_move_group)) {
++    PRINT_INPUT_ERROR("Field-moving group ID should be an integer.");
++  }
++  if (field_move_group < 0 || field_move_group >= group[field_move_grouping_method].number) {
++    PRINT_INPUT_ERROR("Field-moving group ID is out of range.");
++  }
++  printf(
++    "Group %d in grouping method %d will follow its input per-atom velocity field.\n",
++    field_move_group,
++    field_move_grouping_method);
++}
++
+ void Integrate::parse_deform(const char** param, int num_param)
+ {
+   printf("Deform the box.\n");
+--- a/src/integrate/integrate.cuh
++++ b/src/integrate/integrate.cuh
+@@ -68,6 +68,7 @@
+   void parse_deform(const char**, int);
+   void parse_fix(const char**, int, std::vector<Group>& group);
+   void parse_move(const char**, int, std::vector<Group>& group);
++  void parse_move_field(const char**, int, std::vector<Group>& group);
+ 
+   // these data will be used to initialize ensemble
+   int type; // ensemble type in a specific run
+@@ -75,8 +76,10 @@
+   int sink;
+   int fixed_group = -1; // ID of the group in which the atoms will be fixed
+   int move_group = -1;  // ID of the group in which the atoms will move with a constant velocity
++  int field_move_group = -1; // atoms use their input per-atom velocities as prescribed motion
+   int fixed_grouping_method = 0;
+   int move_grouping_method = 0;
++  int field_move_grouping_method = 0;
+   double move_velocity[3];
+ 
+   double temperature;  // target temperature at a specific time
+--- a/src/main_gpumd/kfield_schedule.cuh
++++ b/src/main_gpumd/kfield_schedule.cuh
+@@ -0,0 +1,109 @@
++// Scheduled increments for the previously validated per-atom move_field path.
++#pragma once
++#include "integrate/integrate.cuh"
++#include "utilities/error.cuh"
++#include <cmath>
++#include <fstream>
++#include <string>
++#include <vector>
++
++static __global__ void set_scheduled_field_velocity(
++  int count, int n, const int* index, const double* basis,
++  double dki_over_dt, double dkii_over_dt, double* velocity)
++{
++  int q = blockIdx.x * blockDim.x + threadIdx.x;
++  if (q < count) {
++    int atom = index[q];
++    for (int d = 0; d < 3; ++d) {
++      velocity[atom + d*n] =
++        basis[6*q+d]*dki_over_dt + basis[6*q+3+d]*dkii_over_dt;
++    }
++  }
++}
++
++class KFieldSchedule
++{
++public:
++  bool enabled = false;
++  bool used = false;
++  std::string basis_path, schedule_path;
++  std::vector<double> dki, dkii;
++  GPU_Vector<int> indices;
++  GPU_Vector<double> basis;
++  int count = 0, n = 0;
++
++  void parse(const char** param, int num_param)
++  {
++    if (num_param != 3 || enabled) {
++      PRINT_INPUT_ERROR("Use kfield_schedule basis_file schedule_file once.");
++    }
++    enabled = true;
++    basis_path = param[1];
++    schedule_path = param[2];
++  }
++
++  void initialize(Integrate& integrate, Atom& atom, std::vector<Group>& groups, int steps)
++  {
++    if (!enabled) return;
++    if (used || integrate.field_move_group < 0 ||
++        (integrate.type != 0 && integrate.type != 22)) {
++      PRINT_INPUT_ERROR("kfield_schedule needs one run, move_field, and nve or heat_lan.");
++    }
++    used = true;
++    n = atom.number_of_atoms;
++    const Group& group = groups[integrate.field_move_grouping_method];
++    int expected = group.cpu_size[integrate.field_move_group];
++    int file_n;
++    std::ifstream input(basis_path);
++    if (!(input >> file_n >> count) || file_n != n || count != expected || count <= 0) {
++      PRINT_INPUT_ERROR("Invalid scheduled K-field basis header or boundary atom count.");
++    }
++    std::vector<int> ids(count), seen(n, 0);
++    std::vector<double> values(6*count);
++    for (int q = 0; q < count; ++q) {
++      if (!(input >> ids[q]) || ids[q] < 0 || ids[q] >= n || seen[ids[q]] ||
++          group.cpu_label[ids[q]] != integrate.field_move_group) {
++        PRINT_INPUT_ERROR("Invalid or repeated scheduled boundary atom index.");
++      }
++      seen[ids[q]] = 1;
++      for (int d = 0; d < 6; ++d) {
++        if (!(input >> values[6*q+d]) || !std::isfinite(values[6*q+d])) {
++          PRINT_INPUT_ERROR("Nonfinite or incomplete K-field basis.");
++        }
++      }
++    }
++    std::string extra;
++    if (input >> extra) PRINT_INPUT_ERROR("Extra data in K-field basis.");
++    input.close();
++    input.open(schedule_path);
++    int file_steps;
++    if (!(input >> file_steps) || file_steps != steps) {
++      PRINT_INPUT_ERROR("K-field schedule length must equal run steps.");
++    }
++    dki.resize(steps);
++    dkii.resize(steps);
++    for (int s = 0; s < steps; ++s) {
++      if (!(input >> dki[s] >> dkii[s]) || !std::isfinite(dki[s]) || !std::isfinite(dkii[s])) {
++        PRINT_INPUT_ERROR("Nonfinite or incomplete K-field schedule.");
++      }
++    }
++    if (input >> extra) PRINT_INPUT_ERROR("Extra data in K-field schedule.");
++    indices.resize(count);
++    indices.copy_from_host(ids.data());
++    basis.resize(6*count);
++    basis.copy_from_host(values.data());
++    printf("Scheduled K-field: %d boundary atoms, %d increments.\n", count, steps);
++  }
++
++  void apply(int step, double time_step, Integrate& integrate)
++  {
++    if (!enabled) return;
++    // The secant velocity integrates each prescribed displacement increment exactly.
++    set_scheduled_field_velocity<<<(count+127)/128,128>>>(
++      count, n, indices.data(), basis.data(), dki[step]/time_step, dkii[step]/time_step,
++      integrate.ensemble->field_velocity_per_atom.data());
++    GPU_CHECK_KERNEL
++  }
++};
++
++static KFieldSchedule kfield_schedule;
+--- a/src/main_gpumd/run.cu
++++ b/src/main_gpumd/run.cu
+@@ -27,6 +27,7 @@
+ #include "force/force.cuh"
+ #include "integrate/ensemble.cuh"
+ #include "integrate/integrate.cuh"
++#include "kfield_schedule.cuh"
+ #include "measure/active.cuh"
+ #include "measure/adf.cuh"
+ #include "measure/angular_rdf.cuh"
+@@ -216,6 +217,7 @@
+ void Run::perform_a_run()
+ {
+   integrate.initialize(time_step, atom, box, group, thermo, number_of_steps);
++  kfield_schedule.initialize(integrate, atom, group, number_of_steps);
+   mc.initialize();
+   measure.initialize(number_of_steps, time_step, integrate, group, atom, box, force);
+ 
+@@ -259,6 +261,7 @@
+     global_time += time_step;
+ 
+     integrate.current_step = step;
++    kfield_schedule.apply(step, time_step, integrate);
+     integrate.compute1(time_step, double(step) / number_of_steps, group, box, atom, thermo);
+ 
+     if (integrate.type >= 31) { // PIMD
+@@ -550,6 +553,10 @@
+     integrate.parse_fix(param, num_param, group);
+   } else if (strcmp(param[0], "move") == 0) {
+     integrate.parse_move(param, num_param, group);
++  } else if (strcmp(param[0], "move_field") == 0) {
++    integrate.parse_move_field(param, num_param, group);
++  } else if (strcmp(param[0], "kfield_schedule") == 0) {
++    kfield_schedule.parse(param, num_param);
+   } else if (strcmp(param[0], "electron_stop") == 0) {
+     electron_stop.parse(param, num_param, atom.number_of_atoms, number_of_types);
+   } else if (strcmp(param[0], "add_random_force") == 0) {
