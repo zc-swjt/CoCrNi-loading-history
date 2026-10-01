@@ -4,7 +4,7 @@ Computational and analysis source code for **Loading-history effects on crack-ti
 
 ## Scope
 
-This repository contains the numerical methods used for the study: prescribed mixed-mode boundary loading, anisotropic crack fields, local configurational stresses, stacking-fault areas, reference-coordinate mapping, partial-dislocation motion and local virtual work. It does not contain manuscript files, figure files, plotting programs or simulation-monitoring programs.
+This repository contains the numerical methods used for the study: prescribed mixed-mode boundary loading, anisotropic crack fields, local configurational stresses, stacking-fault areas, reference-coordinate mapping, partial-dislocation motion and local virtual work.
 
 ## Code
 
@@ -22,8 +22,8 @@ This repository contains the numerical methods used for the study: prescribed mi
 - `potential/nep.txt`: the parameter file used for the simulations, with its upstream licence.
 - `DATA_SOURCES.md`: physical data sources, model parameters and array definitions.
 
-Install the Python dependencies with `python -m pip install -r requirements.txt`. The modules operate on the supplied arrays or calculation outputs; paths are passed as arguments rather than tied to the original workstation. The tests can be run with `python code/test_calculations.py`.
+Install the Python dependencies with `python -m pip install -r requirements.txt`. The modules accept numerical arrays or calculation output files as inputs.
 
 ## Licences
 
-The GPUMD and NEP_CPU licences are retained in `engine/LICENCE` and `cpu_evaluator/LICENSE`. The potential licence is in `potential/LICENSE`. These third-party components retain their respective licences; this repository does not replace them with a blanket licence.
+The GPUMD and NEP_CPU licences are retained in `engine/LICENCE` and `cpu_evaluator/LICENSE`. The potential licence is in `potential/LICENSE`.
